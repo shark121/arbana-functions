@@ -7,9 +7,9 @@
  * See a full list of supported triggers at https://firebase.google.com/docs/functions
  */
 
-import { onCall } from "firebase-functions/v2/https";
+import { onCall} from "firebase-functions/v2/https";
 import { initializeApp } from "firebase-admin/app";
-import { getFirestore } from "firebase-admin/firestore";
+import { getFirestore,  } from "firebase-admin/firestore";
 import { onDocumentCreated, onDocumentDeleted} from "firebase-functions/firestore";
 import { algoliasearch } from "algoliasearch";
 
@@ -28,6 +28,9 @@ const client = algoliasearch("W6M4AJCW2Z", "d8b19e7a00ef293456a27f59f480e776");
 initializeApp();
 
 const db = getFirestore();
+
+
+// const  {bucket} =  storage
 
 let counter = 0;
 
@@ -55,41 +58,15 @@ exports.createBundle = onCall(async () => {
   return { text: counter, event: collectionsData };
 });
 
-// async function triggerReIndexing(){
-//   await db
-//   .collection("events/")
-//   .get()
-//   .then(async (response) => {
-//     console.log(
-//       "data retrieved successfully,  adding to record and initiating indexing"
-//     );
-
-//     const dataObject: Record<string, unknown>[] = [];
-//     response.docs.forEach((item) => {
-//       dataObject.push({...item.data(), ObjectjID: item.data().eventID});
-//     });
-
-//     console.log(dataObject)
-
-//     await client
-//       .saveObjects({
-//         indexName: "events_index",
-//         objects: dataObject,
-//       })
-//       .then((res) => console.log("successful indexing "))
-//       .catch((err) => console.log("there was an error indexing:", err));
-//   })
-//   .catch((error) => console.log(error));
-
-// }
-
 exports.reIndexOnDelete = onDocumentDeleted("events/{docId}", async (event) => {
   const {docId} = event.params
+  const docIdSliced = String(docId).slice(0,6)
+
   console.log(docId)
     await client
       .deleteObject({
         indexName: "events_index",
-        objectID : docId
+        objectID : docIdSliced
         // objects: dataObject,
       })
       .then((res) => console.log("successful indexing "))
@@ -99,30 +76,61 @@ exports.reIndexOnDelete = onDocumentDeleted("events/{docId}", async (event) => {
 })
 
 
-exports.reIndexOnCreate = onDocumentCreated("events/{doc}",async (event)=>{
-  
-  await db
-  .collection("events/")
-  .get()
-  .then(async (response) => {
-    console.log(
-      "data retrieved successfully,  adding to record and initiating indexing"
-    );
+exports.reIndexOnCreate = onDocumentCreated("events/{docId}", async (event)=>{
+  const {docId} = event.params
+  const docIdSliced = String(docId).slice(0,6)
+  let docData = event.data?.data()
 
-    const dataObject: Record<string, unknown>[] = [];
-    response.docs.forEach((item) => {
-      dataObject.push({...item.data(), objectID: item.data().eventId});
-    });
+  // console.log(docId, docIdSliced, event.data?.data())
 
-    console.log(dataObject)
+ if (docData) {
+   docData["eventId"] = docIdSliced
+   docData["objectID"] = docIdSliced
 
-    await client
-      .saveObjects({
-        indexName: "events_index",
-        objects: dataObject,
-      })
+   console.log(docId, docData)
+   await client
+   .saveObject({
+     indexName: "events_index",
+     body : docData,
+    })
       .then((res) => console.log("successful indexing "))
       .catch((err) => console.log("there was an error indexing:", err));
-  })
-  .catch((error) => console.log(error));
+      
+      
+   }
+  
+  // await db
+  // .collection("events/")
+  // .get()
+  // .then(async (response) => {
+  //   console.log(
+  //     "data retrieved successfully,  adding to record and initiating indexing"
+  //   );
+
+  //   const dataObject: Record<string, unknown>[] = [];
+  //   response.docs.forEach((item) => {
+  //     const {eventId,...itemData} = item.data()
+  //     itemData["eventId"] = String(eventId).slice(0,6)
+  //     itemData["imageUrl"] = itemData.imageUrl.slice(0,1000)
+      
+  //     console.log(itemData)
+
+  //     dataObject.push({...itemData, objectID: Number(String(item.data().eventId).slice(0,6))});
+  //   });
+
+  //   console.log(dataObject)
+
+  //   await client
+  //     .saveObjects({
+  //       indexName: "events_index",
+  //       objects: dataObject,
+  //     })
+  //     .then((res) => console.log("successful indexing "))
+  //     .catch((err) => console.log("there was an error indexing:", err));
+  // })
+  // .catch((error) => console.log(error));
+
+
+
 })
+
