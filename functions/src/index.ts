@@ -7,9 +7,11 @@
  * See a full list of supported triggers at https://firebase.google.com/docs/functions
  */
 
-import { onCall } from "firebase-functions/v2/https";
+import { onCall} from "firebase-functions/v2/https";
 import { initializeApp } from "firebase-admin/app";
 import { getFirestore } from "firebase-admin/firestore";
+import { getCache, setRedisTriggerEvent, invokeSubscriberCallback} from "./lib/utils"
+import {createTicketEntry, makePaymentRequest, replenishTickets, updateTicketsQuantity, cancelTransaction} from "./lib/functions"
 import {
   onDocumentCreated,
   onDocumentDeleted,
@@ -17,20 +19,13 @@ import {
 import { algoliasearch } from "algoliasearch";
 import { getAuth } from "firebase-admin/auth";
 import { firestore } from "firebase-admin";
+import * as functions from "firebase-functions/v2";
+
 
 const adminStore = firestore;
 
 const client = algoliasearch("W6M4AJCW2Z", "d8b19e7a00ef293456a27f59f480e776");
 
-// import * as logger from "firebase-functions/logger";
-
-// Start writing functions
-// https://firebase.google.com/docs/functions/typescript
-
-// export const helloWorld = onRequest((request, response) => {
-//   logger.info("Hello logs!", {structuredData: true});
-//   response.send("Hello from Firebase!");
-// });
 
 initializeApp();
 
@@ -74,7 +69,6 @@ exports.reIndexOnDelete = onDocumentDeleted("events/{docId}", async (event) => {
     .deleteObject({
       indexName: "events_index",
       objectID: docIdSliced,
-      // objects: dataObject,
     })
     .then((res) => console.log("successful indexing "))
     .catch((err) => console.log("there was an error indexing:", err));
@@ -103,36 +97,7 @@ exports.reIndexOnCreate = onDocumentCreated("events/{docId}", async (event) => {
       .catch((err) => console.log("there was an error indexing:", err));
   }
 
-  // await db
-  // .collection("events/")
-  // .get()
-  // .then(async (response) => {
-  //   console.log(
-  //     "data retrieved successfully,  adding to record and initiating indexing"
-  //   );
-
-  //   const dataObject: Record<string, unknown>[] = [];
-  //   response.docs.forEach((item) => {
-  //     const {eventId,...itemData} = item.data()
-  //     itemData["eventId"] = String(eventId).slice(0,6)
-  //     itemData["imageUrl"] = itemData.imageUrl.slice(0,1000)
-
-  //     console.log(itemData)
-
-  //     dataObject.push({...itemData, objectID: Number(String(item.data().eventId).slice(0,6))});
-  //   });
-
-  //   console.log(dataObject)
-
-  //   await client
-  //     .saveObjects({
-  //       indexName: "events_index",
-  //       objects: dataObject,
-  //     })
-  //     .then((res) => console.log("successful indexing "))
-  //     .catch((err) => console.log("there was an error indexing:", err));
-  // })
-  // .catch((error) => console.log(error));
+ 
 });
 
 type addTeamMemberRequestType = {
@@ -185,14 +150,7 @@ exports.addTeamMember = onCall(async (data) => {
       });
   });
 
-  // const {teamId, teamMember} = data
-  // const teamRef = db.collection("teams").doc(teamId)
-  // const team = await teamRef.get()
-  // const teamData = team.data()
-  // const teamMembers = teamData?.teamMembers || []
-  // teamMembers.push(teamMember)
-  // await teamRef.update({teamMembers})
-  // return {teamMembers}
+
 });
 
 exports.removeTeamMember = onCall(async (data) => {});
@@ -325,6 +283,10 @@ exports.scanTicket = onCall(async (req): Promise<scanResultsType> =>{
 
 
 exports.updateEvent = onCall(async (req) => {
+  // if (req.auth == null ) throw new functions.https.HttpsError("unauthenticated", "Authentication required."); 
+
+ 
+
   const { eventId, userId, data } = req.data;
 
   if (!(eventId && userId && data))
@@ -349,3 +311,71 @@ exports.updateEvent = onCall(async (req) => {
     data: null,
   };
 });
+
+
+
+
+
+
+exports.startPaymentProcess = onCall(async (req) => {
+ console.log(req, "req")
+ console.log(req.data)
+  try {
+    const { amount, provider, ticketData, domain, idToken } = req.data;
+    console.log(amount, provider, ticketData, domain, idToken, "amount, provider, ticketData, domain, idToken");
+
+    if (!amount || !provider || !ticketData || !domain) {
+      throw new functions.https.HttpsError("invalid-argument", JSON.stringify({ response: null, error: "Missing required parameters." }));
+
+    }
+    
+    auth.verifyIdToken(idToken).then((decodedToken) => {
+      const uid = decodedToken.uid;
+      console.log(uid, "uid")
+      if (uid !== ticketData.uid) {
+        throw new functions.https.HttpsError("invalid-argument", JSON.stringify({ response: null, error: "Invalid Credentials." }));
+      }
+    }).catch((error) => {
+      throw new functions.https.HttpsError("invalid-argument", JSON.stringify({ response: null, error: "Invalid Credentials." }));
+    });
+
+    await updateTicketsQuantity(ticketData.quantity, ticketData.tier, ticketData.eventID, db);
+
+    const paymentResponse = await makePaymentRequest(amount, provider, ticketData, domain);
+
+    
+
+    await setRedisTriggerEvent(
+      paymentResponse.response.data.reference,
+      String(ticketData.scans),
+      JSON.stringify(ticketData),
+      60 * 60 * 1 // wait for one hour
+    );
+
+    await invokeSubscriberCallback((key) => {
+      getCache(`${key}_`).then((ticketDataJSONString) => {
+        cancelTransaction(ticketDataJSONString, db);
+      });
+    });
+
+    if (paymentResponse.error) {
+      await replenishTickets(ticketData.quantity, ticketData.tier, ticketData.eventID, db);
+      throw new functions.https.HttpsError("failed-precondition", JSON.stringify({ response: null, error: paymentResponse.error }));
+    }
+
+    const createTicketResponse = await createTicketEntry(ticketData, paymentResponse.response.data.access_code, db);
+
+    if (createTicketResponse.error) {
+      await replenishTickets(ticketData.quantity, ticketData.tier, ticketData.eventID, db);
+      throw new functions.https.HttpsError("internal", JSON.stringify({ response: null, error: createTicketResponse.error }));
+    }
+
+    return { response: paymentResponse, error: null };
+
+  } catch (error) {
+    console.error("Error in payment process:", error);
+    throw new functions.https.HttpsError("internal", JSON.stringify({ response: null, error: String(error) || "Payment process failed." }));
+  }
+});
+
+
