@@ -3,7 +3,13 @@ import * as admin from "firebase-admin";
 
 const PAYSTACK_SECRET="sk_test_df2b43fa0735c8f04d0c1e8d3157a5f9f9331fd0"
 
-export async function makePaymentRequest(amount: number, provider: string, ticketData: any, domain :string) {
+export async function makePaymentRequest(provider: string, ticketData: any, domain :string, db: admin.firestore.Firestore) {
+   
+    const eventDetails =  await db.collection("events").doc(ticketData.eventID).get();
+    const ticketPrice = eventDetails.data()?.availableSeats.find((seat: any) => seat.tier === ticketData.tier).price || 0;
+    const amount = ticketPrice * ticketData.quantity;
+
+
     try {
         const response = await fetch("https://api.paystack.co/transaction/initialize", {
             method: "POST",
@@ -115,3 +121,4 @@ export async function cancelTransaction (ticketDataJSONString:string, db:admin.f
         throw new functions.https.HttpsError("internal", String(error) || "Failed to cancel transaction.");
     }
 }
+

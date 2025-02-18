@@ -5,12 +5,13 @@
  * import {onDocumentWritten} from "firebase-functions/v2/firestore";
  *
  * See a full list of supported triggers at https://firebase.google.com/docs/functions
+ 
  */
 
 import { onCall} from "firebase-functions/v2/https";
 import { initializeApp } from "firebase-admin/app";
 import { getFirestore } from "firebase-admin/firestore";
-import { getCache, setRedisTriggerEvent, invokeSubscriberCallback} from "./lib/utils"
+import { getCache, setRedisTriggerEvent, invokeSubscriberCallback, verifyPayment, deleteFromCache} from "./lib/utils"
 import {createTicketEntry, makePaymentRequest, replenishTickets, updateTicketsQuantity, cancelTransaction} from "./lib/functions"
 import {
   onDocumentCreated,
@@ -18,8 +19,9 @@ import {
 } from "firebase-functions/firestore";
 import { algoliasearch } from "algoliasearch";
 import { getAuth } from "firebase-admin/auth";
-import { firestore } from "firebase-admin";
 import * as functions from "firebase-functions/v2";
+import { firestore } from "firebase-admin";
+
 
 
 const adminStore = firestore;
@@ -31,8 +33,6 @@ initializeApp();
 
 const db = getFirestore();
 const auth = getAuth();
-
-// const  {bucket} =  storage
 
 let counter = 0;
 
@@ -316,19 +316,24 @@ exports.updateEvent = onCall(async (req) => {
 
 
 
+// you can infer very much from the following function that  i have not read the clean code book
 
 exports.startPaymentProcess = onCall(async (req) => {
  console.log(req, "req")
  console.log(req.data)
   try {
-    const { amount, provider, ticketData, domain, idToken } = req.data;
-    console.log(amount, provider, ticketData, domain, idToken, "amount, provider, ticketData, domain, idToken");
+    const { provider, ticketData, domain, idToken } = req.data;
+    console.log( provider, ticketData, domain, idToken, "amount, provider, ticketData, domain, idToken");
 
-    if (!amount || !provider || !ticketData || !domain) {
+    if (!provider || !ticketData || !domain) {
       throw new functions.https.HttpsError("invalid-argument", JSON.stringify({ response: null, error: "Missing required parameters." }));
 
     }
-    
+
+    await updateTicketsQuantity(ticketData.quantity, ticketData.tier, ticketData.eventID, db);
+
+    const paymentResponse = await makePaymentRequest(provider, ticketData, domain, db);
+
     auth.verifyIdToken(idToken).then((decodedToken) => {
       const uid = decodedToken.uid;
       console.log(uid, "uid")
@@ -337,13 +342,7 @@ exports.startPaymentProcess = onCall(async (req) => {
       }
     }).catch((error) => {
       throw new functions.https.HttpsError("invalid-argument", JSON.stringify({ response: null, error: "Invalid Credentials." }));
-    });
-
-    await updateTicketsQuantity(ticketData.quantity, ticketData.tier, ticketData.eventID, db);
-
-    const paymentResponse = await makePaymentRequest(amount, provider, ticketData, domain);
-
-    
+    }); 
 
     await setRedisTriggerEvent(
       paymentResponse.response.data.reference,
@@ -378,4 +377,153 @@ exports.startPaymentProcess = onCall(async (req) => {
   }
 });
 
+
+
+// excercise caution as the next function is absolutely horrendous
+
+exports.updateTeamEvent = functions.https.onCall(async (req) => {
+  try {
+      const { authInfo, eventUploadData, targetEvent } = req.data;
+      
+      console.log(authInfo.token.token, eventUploadData, targetEvent.eventId, "authInfo, eventUploadData, targetEvent")
+
+      if (!authInfo || !eventUploadData || !targetEvent) {
+          throw new functions.https.HttpsError("invalid-argument", "Missing required parameters.");
+      }
+
+      const decodedToken = await auth.verifyIdToken(authInfo.token.token); 
+      const uid = decodedToken.uid;
+
+      if (uid !== authInfo.uid) {
+          throw new functions.https.HttpsError("invalid-argument", "Invalid Credentials.");
+      }
+
+      console.log("Fetching team members.....");
+
+      const teamDoc = await db.collection("teams").doc(String(targetEvent.eventId)).get(); 
+
+      const teamMembers = teamDoc.data(); 
+
+      console.log("teamMembers retrieved.....");
+
+      if (!teamMembers) {
+          throw new functions.https.HttpsError("not-found", "targetEvent not found");
+      }
+
+      const batch = db.batch();
+      
+      console.log("Updating team members.....");
+
+      for (const member in teamMembers) { 
+          // console.log(member, "member")
+          if (teamMembers.hasOwnProperty(member)) { // Check for own properties
+              const userRef = db.collection("users").doc(member);
+
+              const eventToRemove = { ...targetEvent }; // 
+
+              batch.update(userRef, {
+                  events: adminStore.FieldValue.arrayRemove(eventToRemove),
+              });
+
+              batch.update(userRef, {
+                  events: adminStore.FieldValue.arrayUnion(eventUploadData),
+              });
+          }
+      }
+     
+      console.log("Committing batch.....");
+      await batch.commit(); 
+
+      return { message: "Team event updated successfully" }; 
+
+  } catch (error) {
+      console.error("Error in updating team event:", error);
+      if (error instanceof functions.https.HttpsError) { 
+          throw error;
+      }
+      throw new functions.https.HttpsError("internal", "Error in updating team event");
+  }
+});
+
+
+
+exports.completePayment = functions.https.onCall(async (req) => {
+  try {
+    const batch = db.batch();
+    const { reference, ticketId, userId, eventId, trxref } = req.data;
+    
+    console.log("Payment completion request:", req.data);
+
+        if (!reference || !ticketId || !userId || !eventId || !trxref) {
+            throw new functions.https.HttpsError("invalid-argument", "Missing required parameters.");
+        }
+
+        const receiptRef = db.collection("receipts").doc(reference); 
+        const receiptDoc = await receiptRef.get();
+
+        if (receiptDoc.exists) {
+            throw new functions.https.HttpsError("failed-precondition", "Transaction already completed");
+        }
+
+        const paymentDetails = await verifyPayment(reference); 
+        
+        if (!paymentDetails || !paymentDetails.status || paymentDetails.status !== 'success') { 
+          console.error("Payment verification failed:", paymentDetails); 
+          throw new functions.https.HttpsError("failed-precondition", "Payment verification failed.");
+        }
+        
+        batch.set(receiptRef, paymentDetails);
+        
+        const bookingsRef = db.collection("bookings").doc(eventId); 
+        const bookingsDoc = await bookingsRef.get();
+        
+        if (!bookingsDoc.exists) {
+            throw new functions.https.HttpsError("not-found", "Event bookings not found.");
+        }
+
+        const bookingsData = bookingsDoc.data();
+
+        if (bookingsData && bookingsData[ticketId]) { 
+          const ticketData = bookingsData[ticketId]; 
+          
+            ticketData.scans = ticketData?.groupNumber ? ticketData.quantity * ticketData.groupNumber : ticketData.quantity;
+            ticketData.reference = reference;
+            ticketData.trxref = trxref;
+            ticketData.status = "completed";
+            
+            const userDoc = db.collection("users").doc(userId);
+            
+            
+            bookingsData[ticketId] = ticketData;
+            
+            batch.update(userDoc, { tickets: firestore.FieldValue.arrayUnion(ticketData) }); 
+            batch.set(bookingsRef, bookingsData, { merge: true }); 
+            
+            await batch.commit();
+            
+            try {
+              await deleteFromCache(reference);
+              await deleteFromCache(`${reference}_`);
+              console.log("deleted from cache after successful payment");
+            } catch (cacheError) {
+                console.error("Error deleting from cache:", cacheError);
+            }
+
+            return { message: "Payment completed successfully." }; // Return a success message
+
+          } else {
+            console.error("Ticket not found or bookings data is missing:", bookingsData); // Log for debugging
+            throw new functions.https.HttpsError("not-found", "Ticket not found.");
+          }
+          
+        } catch (error) {
+        console.error("Error completing payment:", error);
+
+        if (error instanceof functions.https.HttpsError) {
+            throw error; 
+        }
+
+        throw new functions.https.HttpsError("internal", "An error occurred during payment completion.");
+    }
+})
 

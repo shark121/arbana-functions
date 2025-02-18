@@ -4,6 +4,7 @@ import { createClient } from "redis";
 
 const REDIS_URL="rediss://proud-monster-22871.upstash.io"
 const REDIS_PASSWORD="AVlXAAIjcDExZjVjMTFhMTdiMjI0ZmY2ODczOTlhMTQ0YzkwMWM5N3AxMA"
+const PAYSTACK_SECRET="sk_test_df2b43fa0735c8f04d0c1e8d3157a5f9f9331fd0"
 
 
 const redisClient = createClient({
@@ -127,10 +128,53 @@ async () =>
 
 export async function sendMessage() {}
 
+
+
+
 // export const searchClient = algoliasearch(
 //   process.env.ALGOLIA_APP_ID as string,
 //   process.env.ALGOLIA_SEARCH_KEY as string
 // );
+
+
+export async function verifyPayment(reference:string) {
+  const secretKey = PAYSTACK_SECRET; // Your Paystack secret key
+
+  if (!secretKey) {
+    throw new Error("Paystack secret key must be defined.");
+  }
+
+  const url = `https://api.paystack.co/transaction/verify/${reference}`;
+
+  try {
+    const response = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${secretKey}`, 
+      },
+    });
+
+    if (!response.ok) {
+      const errorData = await response.json(); 
+      throw new Error(`Paystack API error: ${response.status} - ${errorData.message || response.statusText}`);
+    }
+
+    const data = await response.json();
+
+    if (data.status && data.data.status === 'success') {
+      // Payment successful!
+      console.log("Payment verified successfully:", data.data);
+      return data.data; 
+    } else {
+      console.error("Payment verification failed:", data);
+      return null; 
+    }
+
+  } catch (error) {
+    console.error("Error verifying payment:", error);
+    throw error; 
+  }
+}
+
 
 
 
